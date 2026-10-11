@@ -191,6 +191,8 @@ DEFAULTS = {
                       "greetings, small talk, thanks, opinions, simple arithmetic, or requests you cannot do (you only have web "
                       "search and cannot take physical actions or use the computer), answer directly in one or two sentences "
                       "without searching. Reply briefly in plain text, under about 120 words."),
+    "tts_enabled": False,
+    "tts_voice":   "af_heart",
 }
 
 PAUSE_CMDS = {"pause listening", "stop listening", "pause", "go to sleep"}
@@ -210,6 +212,16 @@ HERMES_RISKY = {"terminal", "file", "code_execution", "computer_use", "browser",
                 "connections", "messaging", "memory", "kanban"}
 # Whisper tends to invent these on short noisy clips
 HALLUCINATIONS = {"you", "thank you", "thanks", "thanks for watching", "thank you for watching", "bye", "okay", "uh", "um", "hmm"}
+
+TTS_KOKORO_LABELS = {
+    "af_heart":   "Heart (US ♀)",  "af_bella":   "Bella (US ♀)",  "af_nicole": "Nicole (US ♀)",
+    "bf_emma":    "Emma (UK ♀)",   "bm_george":  "George (UK ♂)",
+    "am_michael": "Michael (US ♂)", "am_puck":   "Puck (US ♂)",
+}
+_TTS_KOKORO_LABEL_TO_KEY = {v: k for k, v in TTS_KOKORO_LABELS.items()}
+_KOKORO_PY     = Path(r"C:\Users\mike\tts\kokoro-venv\Scripts\python.exe")
+_KOKORO_SERVER = Path(r"C:\Users\mike\tts\kokoro_server.py")
+_SENT_END      = re.compile(r"(?<=[.!?])(?:\s|$)")
 
 
 # ---------------------------------------------------------------------------
@@ -1274,6 +1286,148 @@ class Engine:
 
 
 # ---------------------------------------------------------------------------
+# TTS
+# ---------------------------------------------------------------------------
+
+class TtsPlayer:
+    """Streams sentences to Kokoro TTS; playback runs on a background thread."""
+
+    def __init__(self, voice="af_heart"):
+        self.voice = voice
+        self._q    = queue.Queue()
+        self._gen  = 0
+        self._proc = None
+        self._thread = threading.Thread(target=self._worker, daemon=True)
+        self._thread.start()
+
+    def speak(self, text):
+        if text.strip():
+            self._q.put((text.strip(), self._gen))
+
+    def stop(self):
+        self._gen += 1
+        while not self._q.empty():
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                break
+
+    def set_voice(self, voice):
+        self.voice = voice
+
+    def _synthesize(self, text):
+        import wave as _wave
+        import numpy as np
+        if self._proc is None or self._proc.poll() is not None:
+            if not (_KOKORO_PY.exists() and _KOKORO_SERVER.exists()):
+                return None, None
+            self._proc = subprocess.Popen(
+                [str(_KOKORO_PY), str(_KOKORO_SERVER)],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW, text=True, bufsize=1,
+            )
+            # Skip any warning/info lines until we get the protocol "ready"
+            for _ in range(20):
+                line = self._proc.stdout.readline().strip()
+                if line == "ready":
+                    break
+            else:
+                return None, None
+        fd, path = tempfile.mkstemp(suffix=".wav", prefix="vchat_tts_")
+        os.close(fd)
+        try:
+            self._proc.stdin.write(f"{text}|||{self.voice}|||{path}\n")
+            self._proc.stdin.flush()
+            # Skip any warning/info lines until we get "done" or "error: ..."
+            resp = ""
+            for _ in range(20):
+                resp = self._proc.stdout.readline().strip()
+                if resp == "done" or resp.startswith("error:"):
+                    break
+            if resp != "done":
+                os.unlink(path)
+                return None, None
+            with _wave.open(path, "rb") as wf:
+                sr = wf.getframerate()
+                frames = wf.readframes(wf.getnframes())
+            os.unlink(path)
+            arr = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+            return arr, sr
+        except Exception:  # noqa: BLE001
+            try:
+                os.unlink(path)
+            except Exception:  # noqa: BLE001
+                pass
+            return None, None
+
+    def _play(self, arr, sr, gen):
+        import sounddevice as sd
+        CHUNK = 2048
+        with sd.OutputStream(samplerate=sr, channels=1, dtype="float32") as out:
+            i, interrupted = 0, False
+            while i < len(arr):
+                if gen != self._gen:
+                    out.abort()
+                    interrupted = True
+                    break
+                end = min(i + CHUNK, len(arr))
+                out.write(arr[i:end].reshape(-1, 1))
+                i = end
+            if not interrupted:
+                out.stop()
+
+    def _worker(self):
+        # Pre-start: load Kokoro model now in the background so first TTS call is instant.
+        if _KOKORO_PY.exists() and _KOKORO_SERVER.exists():
+            try:
+                self._synthesize("hello")       # starts server + loads model; audio discarded
+            except Exception:                   # noqa: BLE001
+                pass
+
+        while True:
+            try:
+                text, gen = self._q.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if gen != self._gen:
+                continue
+            try:
+                arr, sr = self._synthesize(text)
+                if arr is not None and gen == self._gen:
+                    self._play(arr, sr, gen)
+            except Exception:  # noqa: BLE001
+                pass
+
+
+class TtsSentenceBuffer:
+    """Splits streaming LLM text into sentences and fires a callback for each."""
+
+    def __init__(self, on_sentence):
+        self._cb  = on_sentence
+        self._pos = 0
+
+    def feed(self, text):
+        while True:
+            m = _SENT_END.search(text, self._pos)
+            if not m:
+                break
+            sentence = text[self._pos:m.end()].strip()
+            if sentence:
+                self._cb(sentence)
+            self._pos = m.end()
+
+    def flush(self, text):
+        self._pos = min(self._pos, len(text))
+        remainder = text[self._pos:].strip()
+        if remainder:
+            self._cb(remainder)
+        self._pos = 0
+
+    def reset(self):
+        self._pos = 0
+
+
+# ---------------------------------------------------------------------------
 # GUI
 # ---------------------------------------------------------------------------
 DEFAULT_THEME = "Midnight (dark)"
@@ -1356,6 +1510,8 @@ def run_gui():
             pass
 
     settings = load_settings()
+    tts = TtsPlayer(voice=settings.get("tts_voice", "af_heart"))
+    tts_buf = TtsSentenceBuffer(tts.speak)
     evq = queue.Queue()
     monitor = Monitor()
     monitor.start()
@@ -1579,9 +1735,13 @@ def run_gui():
 
     def finish_ai():
         ins_at_ai_end("\n", "ai")
-        if ai["end"] and ai["end"].get("stopped"):
+        stopped = bool(ai["end"] and ai["end"].get("stopped"))
+        if stopped:
             ins_at_ai_end("(stopped)\n", "sys")
         ai.update(open=False, end=None)
+        if settings.get("tts_enabled") and not stopped:
+            text = ai["target"]
+            root.after(1000, lambda t=text: tts.speak(t))
 
     def flush_ai():                                       # show everything right now and close the block
         rest = ai["target"][len(ai["shown"]):] if ai["target"].startswith(ai["shown"]) else None
@@ -1718,7 +1878,7 @@ def run_gui():
     btn_pause.pack(side="left", padx=(8, 0))
     ttk.Button(bar, text="New session", command=lambda: threading.Thread(target=engine.new_session, daemon=True).start()).pack(side="left", padx=(6, 0))
     ttk.Button(bar, text="End & save", command=lambda: threading.Thread(target=engine.end_now, daemon=True).start()).pack(side="left", padx=(6, 0))
-    ttk.Button(bar, text="Stop answer", command=lambda: engine.abort.set()).pack(side="left", padx=(6, 0))
+    ttk.Button(bar, text="Stop answer", command=lambda: (engine.abort.set(), tts.stop())).pack(side="left", padx=(6, 0))
     ttk.Button(bar, text="A-", width=3, command=lambda: set_font_size(-2)).pack(side="left", padx=(6, 0))
     ttk.Button(bar, text="A+", width=3, command=lambda: set_font_size(2)).pack(side="left", padx=(2, 0))
     ttk.Button(bar, text="Pop out", command=pop_out).pack(side="left", padx=(6, 0))
@@ -1860,6 +2020,20 @@ def run_gui():
     sp.columnconfigure(1, weight=1)
     sp.columnconfigure(3, weight=1)
 
+    # TTS row (row 12)
+    v_tts       = tk.BooleanVar(value=bool(settings.get("tts_enabled", False)))
+    _kok_init   = TTS_KOKORO_LABELS.get(settings.get("tts_voice", "af_heart"), "Heart (US ♀)")
+    v_tts_voice = tk.StringVar(value=_kok_init)
+    tts_frame   = ttk.Frame(sp)
+    ttk.Checkbutton(tts_frame, text="Read answers aloud", variable=v_tts).pack(side="left")
+    ttk.Label(tts_frame, text="  Voice:").pack(side="left")
+    cb_tts_voice = ttk.Combobox(tts_frame, textvariable=v_tts_voice,
+                                values=list(TTS_KOKORO_LABELS.values()), state="readonly", width=14)
+    cb_tts_voice.pack(side="left", padx=(4, 8))
+    combos.append(cb_tts_voice)
+    ttk.Button(tts_frame, text="Stop speaking", command=lambda: tts.stop()).pack(side="left", padx=(4, 0))
+    tts_frame.grid(row=12, column=0, columnspan=4, sticky="w", padx=8, pady=3)
+
     def settings_changed(*_):
         settings["ollama_model"] = v["ollama_model"].get().strip()
         settings["language"] = v["language"].get().strip() or "en"
@@ -1879,6 +2053,11 @@ def run_gui():
                 settings[key] = max(lo, min(hi, int(float(var.get()))))     # ignore half-typed values
             except ValueError:
                 pass
+        settings["tts_enabled"] = v_tts.get()
+        raw_voice = _TTS_KOKORO_LABEL_TO_KEY.get(v_tts_voice.get())
+        if raw_voice:
+            settings["tts_voice"] = raw_voice
+            tts.set_voice(raw_voice)
         save_settings(settings)
 
     for var in (v["ollama_model"], v["language"], v["wake_word"], v_wake, v_sil, v_sens, v_sess, v_ram):
@@ -1887,6 +2066,8 @@ def run_gui():
     for var in (v_amodel, v_tools, v_reason):
         var.trace_add("write", settings_changed)
     txt_aprefix.bind("<FocusOut>", settings_changed)
+    v_tts.trace_add("write", settings_changed)
+    cb_tts_voice.bind("<<ComboboxSelected>>", settings_changed)
 
     def on_preset(_=None):
         name = v_preset.get()
@@ -2040,6 +2221,7 @@ def run_gui():
         elif kind == "user":
             put("You:  " + kw["text"], "you")
         elif kind == "ai_start":
+            tts.stop()
             if ai["open"]:
                 flush_ai()                                # previous answer was still being typed out
             chat.config(state="normal")
@@ -2092,6 +2274,9 @@ def run_gui():
                 handle(*evq.get_nowait())
         except queue.Empty:
             pass
+        except Exception:  # noqa: BLE001 — never let a handle() crash kill the loop
+            import traceback
+            traceback.print_exc()
         root.after(40, poll)
 
     # ----- go
@@ -2114,6 +2299,7 @@ def run_gui():
 
     def on_close():
         engine.stop()
+        tts.stop()
         engine.save_session()                             # never lose notes when closing mid-session
         monitor.stop()
         if stream["s"]:
