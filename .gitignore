@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime session logs
+voice_chat_sessions/
+
+# User data / settings (generated at runtime)
+voice_chat_data/
+voice_chat_v2_data/
+voice_chat_hermes_cwd/
